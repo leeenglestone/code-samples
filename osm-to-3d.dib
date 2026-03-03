@@ -1,0 +1,245 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"name":"csharp","languageName":"csharp"},{"name":"fsharp","languageName":"F#","aliases":["f#","fs"]},{"name":"html","languageName":"HTML"},{"name":"http","languageName":"HTTP"},{"name":"javascript","languageName":"JavaScript","aliases":["js"]},{"name":"mermaid","languageName":"Mermaid"},{"name":"pwsh","languageName":"PowerShell","aliases":["powershell"]},{"name":"value"}]}}
+
+#!markdown
+
+# OSM Data to 3D Model
+## Creates a GLTF/GLB 3D model of buildings in a geographic using OSM (Open Street Map) data
+
+Caveats: 
+- Vibe coded code very quickly (not production ready/quality)
+- Creates overly complex geometries (could/should be optimised)
+
+#!csharp
+
+#r "nuget: SharpGLTF.Core"
+#r "nuget: SharpGLTF.Toolkit"
+
+#!csharp
+
+using System;
+using System.Linq;
+using System.Numerics;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Collections.Generic;
+using SharpGLTF.Geometry;
+using SharpGLTF.Geometry.VertexTypes;
+using SharpGLTF.Materials;
+using SharpGLTF.Scenes;
+
+public class Program
+{
+    public static void Main()
+    {
+        // London
+        //51.50891, -0.08493
+        double longitude = -0.08493;
+        double latitude = 51.50891;
+
+        double south = latitude - 0.005;
+        double west = longitude - 0.005;
+        double north = latitude + 0.005;
+        double east = longitude + 0.005;
+
+
+        Console.WriteLine("Downloading OSM building data...");
+
+        string query =
+            "[out:json];" +
+            "(" +
+            "way[\"building\"](" + south + "," + west + "," + north + "," + east + ");" +
+            ");" +
+            "out body;" +
+            ">;" +
+            "out skel qt;";
+
+        var client = new HttpClient();
+        var content = new StringContent(query, Encoding.UTF8, "application/x-www-form-urlencoded");
+        var response = client.PostAsync("https://overpass-api.de/api/interpreter", content).Result;
+        response.EnsureSuccessStatusCode();
+
+        var json = response.Content.ReadAsStringAsync().Result;
+        var osm = JsonSerializer.Deserialize<OverpassResponse>(json);
+
+        if (osm == null)
+        {
+            Console.WriteLine("Failed to parse OSM.");
+            return;
+        }
+
+        var nodes = osm.elements
+            .Where(e => e.type == "node")
+            .ToDictionary(e => e.id, e => new LatLon(e.lat.Value, e.lon.Value));
+
+        if (nodes.Count == 0)
+        {
+            Console.WriteLine("No nodes returned.");
+            return;
+        }
+
+        var first = nodes.Values.First();
+        var origin = LatLonToMeters(first.Lat, first.Lon);
+
+        var scene = new SceneBuilder();
+
+        var material = new MaterialBuilder()
+            .WithDoubleSide(true)
+            .WithMetallicRoughnessShader()
+            .WithChannelParam(KnownChannel.BaseColor, new Vector4(0.7f, 0.7f, 0.75f, 1f));
+
+        int buildingCount = 0;
+
+        foreach (var way in osm.elements.Where(e => e.type == "way"))
+        {
+            if (way.nodes == null) continue;
+
+            var footprint = new List<Vector2>();
+
+            foreach (var nodeId in way.nodes)
+            {
+                LatLon latlon;
+                if (!nodes.TryGetValue(nodeId, out latlon)) continue;
+
+                var meters = LatLonToMeters(latlon.Lat, latlon.Lon);
+
+                float x = (float)(meters.Item1 - origin.Item1);
+                float z = (float)(meters.Item2 - origin.Item2);
+
+                footprint.Add(new Vector2(x, z));
+            }
+
+            if (footprint.Count < 3) continue;
+
+            float height = GetHeight(way);
+
+            var mesh = BuildMesh(footprint, height, material);
+            scene.AddRigidMesh(mesh, Matrix4x4.Identity);
+
+            buildingCount++;
+        }
+
+        string output = System.IO.Path.Combine(Environment.CurrentDirectory, "city.glb");
+        scene.ToGltf2().SaveGLB(output);
+
+        Console.WriteLine("GLB exported: " + output);
+        Console.WriteLine("Buildings: " + buildingCount);
+    }
+
+    static float GetHeight(Element way)
+    {
+        if (way.tags != null)
+        {
+            string h;
+            if (way.tags.TryGetValue("height", out h))
+            {
+                float parsed;
+                if (float.TryParse(h.Replace("m", ""), out parsed))
+                    return parsed;
+            }
+
+            string levels;
+            if (way.tags.TryGetValue("building:levels", out levels))
+            {
+                float l;
+                if (float.TryParse(levels, out l))
+                    return l * 3f;
+            }
+        }
+
+        return 10f;
+    }
+
+    static MeshBuilder<VertexPositionNormal> BuildMesh(
+        List<Vector2> footprint,
+        float height,
+        MaterialBuilder material)
+    {
+        var mesh = new MeshBuilder<VertexPositionNormal>();
+        var prim = mesh.UsePrimitive(material);
+
+        int count = footprint.Count;
+
+        var bottom = new List<Vector3>();
+        var top = new List<Vector3>();
+
+        foreach (var p in footprint)
+        {
+            bottom.Add(new Vector3(p.X, 0, p.Y));
+            top.Add(new Vector3(p.X, height, p.Y));
+        }
+
+        // Roof (fan triangulation)
+        for (int i = 1; i < count - 1; i++)
+        {
+            prim.AddTriangle(
+                new VertexPositionNormal(top[0], Vector3.UnitY),
+                new VertexPositionNormal(top[i], Vector3.UnitY),
+                new VertexPositionNormal(top[i + 1], Vector3.UnitY));
+        }
+
+        // Walls
+        for (int i = 0; i < count; i++)
+        {
+            int next = (i + 1) % count;
+
+            var p1 = bottom[i];
+            var p2 = bottom[next];
+            var p3 = top[next];
+            var p4 = top[i];
+
+            var normal = Vector3.Normalize(Vector3.Cross(p2 - p1, p4 - p1));
+
+            prim.AddTriangle(
+                new VertexPositionNormal(p1, normal),
+                new VertexPositionNormal(p2, normal),
+                new VertexPositionNormal(p3, normal));
+
+            prim.AddTriangle(
+                new VertexPositionNormal(p1, normal),
+                new VertexPositionNormal(p3, normal),
+                new VertexPositionNormal(p4, normal));
+        }
+
+        return mesh;
+    }
+
+    static Tuple<double, double> LatLonToMeters(double lat, double lon)
+    {
+        double R = 6378137;
+        double x = R * lon * Math.PI / 180.0;
+        double y = R * Math.Log(Math.Tan((90 + lat) * Math.PI / 360.0));
+        return Tuple.Create(x, y);
+    }
+}
+
+public class LatLon
+{
+    public double Lat;
+    public double Lon;
+
+    public LatLon(double lat, double lon)
+    {
+        Lat = lat;
+        Lon = lon;
+    }
+}
+
+public class OverpassResponse
+{
+    public List<Element> elements { get; set; }
+}
+
+public class Element
+{
+    public string type { get; set; }
+    public long id { get; set; }
+    public double? lat { get; set; }
+    public double? lon { get; set; }
+    public List<long> nodes { get; set; }
+    public Dictionary<string, string> tags { get; set; }
+}
+
+Program.Main();
